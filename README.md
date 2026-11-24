@@ -13,7 +13,7 @@ Two repositories:
 | Repository | Contains | Who can change it |
 |---|---|---|
 | `regalo` (public) | The website: `index.html`, `style.css`, `app.js`, `lib.js`, `connection.json`, `fonts/` | Only you, on GitHub |
-| `regalo-data` (private) | The gifts, votes and names (`wishlist.json`) and uploaded photos (`images/`) | Everyone, through the website |
+| `regalo-data` (private) | The gifts, votes and names (`wishlist.json`), uploaded photos (`images/`) and the activity log (`activity-log.md`) | Everyone, through the website |
 
 `connection.json` holds a key that can only change `regalo-data`. Because of that split, nobody can ever change the website itself.
 
@@ -38,6 +38,27 @@ When **updating the website files** later, upload everything except `connection.
 - **Title, subtitle, birthday date, currency:** **Settings** at the bottom.
 - Tapping a gift opens the store.
 
+## Activity log (for the owner)
+
+Every add, edit, removal and settings change is written quietly to **`activity-log.md`** in the private `regalo-data` repository. Nothing is shown to the person making the change. Open the file on GitHub to read it (newest first).
+
+Each row has: the time (UTC), what happened (with old → new values for edits), and who:
+- the person's **name**, if they have voted on that device
+- a **device code**: a random code kept in that browser, so the same code means the same phone or computer
+- the **browser type**, for example "Safari on iPhone"
+
+No IP addresses, locations or other personal data are collected.
+
+Rows marked **⚠** were flagged by automatic checks:
+- the link is not https, uses a link shortener or a bare IP address
+- the text contains spam words (casino, crypto…) or your own words from **Settings → Extra words to flag in the log**
+- the price is unusually high, or the same link is already on the list
+- a gift added from one device is removed or changed from another device
+- 3 or more removals from one device within 10 minutes
+- the page settings were changed
+
+To undo damage: open `wishlist.json` in `regalo-data` → **History**, open the version from before the change, and copy it back (or ask for help).
+
 ## When something does not work
 
 | Problem | What to do |
@@ -51,6 +72,7 @@ When **updating the website files** later, upload everything except `connection.
 
 - No password means anyone with the link can change the list. Share the link only with people you trust.
 - Someone with technical skills could take the key out of `connection.json`. It only reaches the private `regalo-data` repository, so the worst case is a messed-up gift list, which can be restored from its history. The website itself cannot be changed with it.
+- The activity log lives in the same data repository, so someone technical with the key could edit it too; GitHub's history of the file still shows every earlier version.
 - Names and PINs are for recognising people, not real security: PINs are stored only as salted hashes, but a 4-digit PIN could be guessed by someone determined. Do not reuse a bank PIN.
 - Product links are sent to Microlink (microlink.io), a free service, to read the name and photo, with a limited number of lookups per person per day.
 - The page only talks to `api.github.com` and `api.microlink.io` (enforced by a Content Security Policy), shows all text as plain text, and asks search engines not to index it.

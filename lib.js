@@ -161,6 +161,21 @@ export class GitHub {
       }
     }
   }
+
+  /** Same as updateJson, for a text file (the activity log). `mutate` gets null if the file is new. */
+  async updateText(path, mutate, message, attempts = 5) {
+    for (let i = 0; ; i++) {
+      const f = await this.getFile(path);
+      const next = mutate(f ? b64ToText(f.content) : null);
+      try {
+        await this.putFile(path, textToB64(next), message, f && f.sha);
+        return next;
+      } catch (e) {
+        if ((e.status === 409 || e.status === 422) && i < attempts - 1) continue;
+        throw e;
+      }
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -207,6 +222,7 @@ export function sanitizeWishlist(raw) {
     subtitle: str(s.subtitle, 300),
     date: /^\d{4}-\d{2}-\d{2}$/.test(s.date) ? s.date : '',
     currency: /^[A-Z]{3}$/.test(s.currency) ? s.currency : 'EUR',
+    flagWords: Array.isArray(s.flagWords) ? s.flagWords.map((w) => str(w, 40)).filter(Boolean).slice(0, 50) : [],
   };
   const players = {};
   if (raw.players && typeof raw.players === 'object') {
@@ -235,6 +251,7 @@ export function sanitizeWishlist(raw) {
         image: isSafeImage(it.image) ? it.image : '',
         note: str(it.note, 300),
         added: str(it.added, 30),
+        addedBy: str(it.addedBy, 16),
         votes: [...new Set(Array.isArray(it.votes) ? it.votes.filter((k) => typeof k === 'string' && players[k]) : [])],
       };
     })
@@ -354,4 +371,133 @@ export async function lookupLink(url, fetchImpl = (...a) => fetch(...a)) {
   // Bot-check pages are not products.
   if (/robot|captcha|access denied|just a moment|attention required/i.test(name)) throw new Error('The store blocked the lookup');
   return { name, store, image };
+}
+
+/* ------------------------------------------------------------------ */
+/* Activity log (read by the owner in the private data repository)    */
+/* Only harmless information: time, what changed, the voting name if  */
+/* known, a random device code and the browser type. No IP addresses. */
+/* ------------------------------------------------------------------ */
+
+export const LOG_FILE = 'activity-log.md';
+const LOG_MAX_ROWS = 1000; // older rows stay in the file's GitHub history
+
+/** "Chrome on Android", "Safari on iPhone"... from the browser's user agent. */
+export function deviceLabel(ua = '') {
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac OS X|Macintosh/.test(ua) ? 'Mac' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : 'unknown system';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /OPR\/|Opera/.test(ua) ? 'Opera' : /Firefox\/|FxiOS/.test(ua) ? 'Firefox' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'unknown browser';
+  return `${browser} on ${os}`;
+}
+
+const SHORTENERS = /^(bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|cutt\.ly|rebrand\.ly|ow\.ly|buff\.ly|shorturl\.at|rb\.gy|tiny\.cc|s\.id|v\.gd|t\.ly)$/i;
+const SPAM_WORDS = ['casino', 'bet365', 'crypto', 'bitcoin', 'viagra', 'porn', 'xxx', 'onlyfans', 'free money', 'loan', 'nsfw', 'escort'];
+
+/**
+ * Automatic checks. Returns short reasons; an empty list means nothing looks unusual.
+ * entry: {action, before, after, device}; context: {items, recentRemovals (timestamps), flagWords}
+ */
+export function detectFlags(entry, context = {}) {
+  const flags = [];
+  const item = entry.after || entry.before;
+  if (item && item.url && (entry.action === 'add' || (entry.action === 'edit' && entry.before && entry.before.url !== entry.after.url))) {
+    try {
+      const u = new URL(item.url);
+      if (u.protocol !== 'https:') flags.push('link is not https');
+      if (SHORTENERS.test(u.hostname.replace(/^www\./, ''))) flags.push('link uses a URL shortener');
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(u.hostname) || u.hostname.includes(':')) flags.push('link is a bare IP address');
+    } catch {
+      flags.push('link is not valid');
+    }
+  }
+  if (item && (entry.action === 'add' || entry.action === 'edit')) {
+    const text = `${item.name || ''} ${item.note || ''} ${item.store || ''} ${item.url || ''}`.toLowerCase();
+    const words = [...SPAM_WORDS, ...(context.flagWords || [])].map((w) => String(w).toLowerCase().trim()).filter(Boolean);
+    const hits = words.filter((w) => text.includes(w));
+    if (hits.length) flags.push(`contains "${hits.join('", "')}"`);
+    const prices = (context.items || []).map((i) => i.price).filter((p) => typeof p === 'number' && p > 0).sort((a, b) => a - b);
+    const median = prices.length ? prices[Math.floor(prices.length / 2)] : 0;
+    if (typeof item.price === 'number' && (item.price >= 1000 || (median && prices.length >= 3 && item.price > median * 5))) flags.push('unusually high price');
+    if (entry.action === 'add' && (context.items || []).some((i) => i.id !== item.id && i.url === item.url)) flags.push('same link already on the list');
+  }
+  if (entry.before && entry.before.addedBy && entry.device && entry.before.addedBy !== entry.device) {
+    if (entry.action === 'remove') flags.push('removed a gift added from another device');
+    if (entry.action === 'edit' && (entry.before.url !== entry.after.url || entry.before.price !== entry.after.price || entry.before.name !== entry.after.name)) flags.push('changed a gift added from another device');
+  }
+  if (entry.action === 'remove' && (context.recentRemovals || []).length >= 3) flags.push(`${context.recentRemovals.length} removals from this device in 10 minutes`);
+  if (entry.action === 'settings') flags.push('page settings changed');
+  return flags;
+}
+
+/** Makes untrusted text safe inside a Markdown table cell (no links, HTML or table breaks). */
+export function mdCell(text, max = 120) {
+  return String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/[\\`*_{}\[\]()#+!|~]/g, (c) => `\\${c}`);
+}
+
+function mdLink(url) {
+  if (!isHttpUrl(url)) return mdCell(url, 80);
+  const safe = encodeURI(decodeURI(url)).replace(/[()<>\s|]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  let host = '';
+  try {
+    host = new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    host = 'link';
+  }
+  return `[${mdCell(host, 40)}](${safe})`;
+}
+
+const FIELDS = ['name', 'store', 'price', 'url', 'image', 'note'];
+
+function describeItem(it) {
+  if (!it) return '';
+  return [it.price != null ? `${it.price} ${it.currency || ''}`.trim() : 'no price', it.note ? `note: ${mdCell(it.note, 60)}` : ''].filter(Boolean).join(' · ');
+}
+
+function describeChanges(before, after, fields = FIELDS) {
+  return fields.filter((f) => (before[f] ?? '') !== (after[f] ?? ''))
+    .map((f) => (f === 'url' || f === 'image' ? `${f} changed` : `${f}: ${mdCell(before[f] === '' || before[f] == null ? '–' : before[f], 40)} → ${mdCell(after[f] === '' || after[f] == null ? '–' : after[f], 40)}`))
+    .join('; ');
+}
+
+/** One Markdown table row for the activity log. */
+export function formatLogRow(entry, flags) {
+  const when = new Date(entry.time).toISOString().slice(0, 16).replace('T', ' ');
+  const item = entry.after || entry.before;
+  const action = { add: 'Added', edit: 'Edited', remove: 'Removed', settings: 'Settings' }[entry.action] || entry.action;
+  let gift = '';
+  let details = '';
+  if (entry.action === 'settings') {
+    gift = '–';
+    details = describeChanges(entry.before || {}, entry.after || {}, ['title', 'subtitle', 'date', 'currency', 'flagWords']) || 'no visible change';
+  } else {
+    gift = `${mdCell(item.name, 60)} (${mdLink(item.url)})`;
+    details = entry.action === 'edit' ? describeChanges(entry.before, entry.after) || 'no visible change' : describeItem(item);
+  }
+  const who = `${entry.who ? mdCell(entry.who, 24) : 'unknown name'} · device ${mdCell(entry.device, 12)} · ${mdCell(entry.deviceLabel, 40)}`;
+  const flag = flags.length ? `⚠ ${mdCell(flags.join('; '), 200)}` : '';
+  return `| ${when} | ${action} | ${gift} | ${details} | ${who} | ${flag} |`;
+}
+
+const LOG_HEADER = `# Wishlist activity log
+
+Written automatically by the website. Newest first. Times are UTC.
+"Device" is a random code stored in that browser: the same code means the same phone or computer.
+Rows marked ⚠ were flagged by the automatic checks. Earlier versions of any gift can be restored from the history of \`wishlist.json\`.
+
+| When (UTC) | Action | Gift | Details | Who | Check |
+|---|---|---|---|---|---|
+`;
+
+/** Puts the new row at the top of the table, keeping at most LOG_MAX_ROWS rows. */
+export function prependLogRow(existing, row) {
+  const rows = (existing || '')
+    .split('\n')
+    .filter((l) => /^\| \d{4}-\d{2}-\d{2} /.test(l));
+  return `${LOG_HEADER}${[row, ...rows].slice(0, LOG_MAX_ROWS).join('\n')}\n`;
 }

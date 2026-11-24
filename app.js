@@ -21,6 +21,11 @@ import {
   pinHash,
   playerKey,
   randomB64,
+  LOG_FILE,
+  detectFlags,
+  deviceLabel,
+  formatLogRow,
+  prependLogRow,
   lookupLink,
   newId,
   parsePrice,
@@ -60,6 +65,40 @@ const state = {
 };
 
 class UserError extends Error {}
+
+/* ------------------------------------------------------------------ */
+/* Activity log: written quietly to the private data repository        */
+/* ------------------------------------------------------------------ */
+
+function deviceId() {
+  let id = local.get('device');
+  if (typeof id !== 'string' || !/^[a-z0-9]{8}$/.test(id)) {
+    id = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => 'abcdefghjkmnpqrstuvwxyz23456789'[b % 31]).join('');
+    local.set('device', id);
+  }
+  return id;
+}
+
+function recentRemovals() {
+  const since = Date.now() - 10 * 60 * 1000;
+  const list = (Array.isArray(local.get('removals')) ? local.get('removals') : []).filter((t) => t > since);
+  return list;
+}
+
+/** Never shows anything to the person making the change, and never blocks or fails their action. */
+function logActivity(entry) {
+  try {
+    const full = { ...entry, time: Date.now(), device: deviceId(), deviceLabel: deviceLabel(navigator.userAgent), who: state.profile ? state.profile.name : '' };
+    if (entry.action === 'remove') local.set('removals', [...recentRemovals(), full.time]);
+    const flags = detectFlags(full, { items: state.data.items, recentRemovals: entry.action === 'remove' ? recentRemovals() : [], flagWords: state.data.settings.flagWords });
+    const row = formatLogRow(full, flags);
+    github()
+      .updateText(LOG_FILE, (text) => prependLogRow(text, row), flags.length ? 'Activity (flagged)' : 'Activity')
+      .catch(() => {});
+  } catch {
+    /* logging must never get in the way */
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -665,9 +704,10 @@ function openItemForm(existing) {
       };
       await save((d) => {
         const i = d.items.findIndex((x) => x.id === item.id);
-        if (i === -1) d.items.unshift({ ...item, votes: [] });
-        else d.items[i] = { ...item, votes: d.items[i].votes };
+        if (i === -1) d.items.unshift({ ...item, votes: [], addedBy: deviceId() });
+        else d.items[i] = { ...item, votes: d.items[i].votes, addedBy: d.items[i].addedBy };
       }, `${isNew ? 'Add' : 'Edit'} gift: ${item.name}`);
+      logActivity(isNew ? { action: 'add', after: item } : { action: 'edit', before: it, after: { ...item, addedBy: it.addedBy } });
       // Remove the old uploaded photo if it was replaced (best effort).
       if (!isNew && it.image && it.image !== image && it.image.startsWith('images/')) github().deleteFile(it.image, 'Remove old photo').catch(() => {});
       dialog.close();
@@ -687,6 +727,7 @@ function confirmRemove(it) {
       await save((d) => {
         d.items = d.items.filter((x) => x.id !== it.id);
       }, `Remove gift: ${it.name}`);
+      logActivity({ action: 'remove', before: it });
       if (it.image.startsWith('images/')) github().deleteFile(it.image, 'Remove photo').catch(() => {});
       dialog.close();
       toast('Removed.');
@@ -712,16 +753,26 @@ function openSettings() {
   const subtitle = h('input', { class: 'input', type: 'text', value: s.subtitle, maxlength: 300 });
   const date = h('input', { class: 'input', type: 'date', value: s.date });
   const currency = h('select', { class: 'input' }, CURRENCIES.map((c) => h('option', { value: c, selected: c === s.currency ? true : null }, c)));
+  const flagWords = h('input', { class: 'input', type: 'text', value: s.flagWords.join(', '), placeholder: 'e.g. joke, test', autocomplete: 'off' });
   const error = errorLine();
   const submit = h('button', { type: 'submit', class: 'button button--solid' }, 'Save');
-  const pageForm = h('form', { class: 'form' }, field('Title', title), field('Subtitle', subtitle), h('div', { class: 'row' }, field('Birthday', date), field('Currency', currency)), error, submit);
+  const pageForm = h('form', { class: 'form' }, field('Title', title), field('Subtitle', subtitle), h('div', { class: 'row' }, field('Birthday', date), field('Currency', currency)), field('Extra words to flag in the log', flagWords, 'Separated by commas. Gifts containing them are marked for you to check.'), error, submit);
   pageForm.addEventListener('submit', (e) => {
     e.preventDefault();
     if (!title.value.trim()) return void (error.textContent = 'The title cannot be empty.');
     busy(submit, error, 'Saving…', async () => {
+      const before = { ...state.data.settings, flagWords: state.data.settings.flagWords.join(', ') };
+      const after = {
+        title: title.value.trim(),
+        subtitle: subtitle.value.trim(),
+        date: date.value,
+        currency: currency.value,
+        flagWords: flagWords.value.split(',').map((w) => w.trim()).filter(Boolean).slice(0, 50),
+      };
       await save((d) => {
-        d.settings = { title: title.value.trim(), subtitle: subtitle.value.trim(), date: date.value, currency: currency.value };
+        d.settings = after;
       }, 'Update page settings');
+      logActivity({ action: 'settings', before, after: { ...after, flagWords: after.flagWords.join(', ') } });
       dialog.close();
       toast('Saved.');
     });
