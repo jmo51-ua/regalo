@@ -17,6 +17,10 @@ import {
   encodeConnection,
   isHttpUrl,
   isSafeImage,
+  isValidPin,
+  pinHash,
+  playerKey,
+  randomB64,
   lookupLink,
   newId,
   parsePrice,
@@ -27,11 +31,35 @@ import {
 const DATA_FILE = 'wishlist.json';
 const CONNECTION_FILE = 'connection.json';
 
+// Several wishlists can live on one username.github.io, so device storage keys include the path.
+const NS = `wishlist:${location.pathname}`;
+const local = {
+  get(key) {
+    try {
+      return JSON.parse(localStorage.getItem(`${NS}:${key}`));
+    } catch {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      if (value === null) localStorage.removeItem(`${NS}:${key}`);
+      else localStorage.setItem(`${NS}:${key}`, JSON.stringify(value));
+    } catch {
+      /* private mode: works until the page is closed */
+    }
+  },
+};
+
 const state = {
   data: emptyWishlist(),
   config: null, // {owner, repo, branch, token} of the data repository, or null before setup
   photos: new Map(), // images/... in the data repository -> blob URL
+  profile: null, // {key, name, hash}: who is voting on this device
+  selected: new Set(Array.isArray(local.get('selected')) ? local.get('selected') : []), // this device only
 };
+
+class UserError extends Error {}
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -57,6 +85,8 @@ function h(tag, props, ...children) {
 
 const ICONS = {
   plus: ['M12 5v14', 'M5 12h14'],
+  check: ['M5 12.5l4.5 4.5L19 7.5'],
+  heart: ['M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z'],
   close: ['M6 6l12 12', 'M18 6L6 18'],
   edit: ['M4 20h4L19 9l-4-4L4 16z', 'M13.5 6.5l4 4'],
   camera: ['M4 8h3l2-3h6l2 3h3v11H4z', 'M12 17a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z'],
@@ -129,7 +159,24 @@ async function load() {
       toast(e instanceof GitHubError && e.status === 404 ? 'The gift list was not found. The owner can check Settings.' : e.message, 8000);
     }
   }
+  state.profile = local.get('profile');
+  checkProfile();
+  const ids = new Set(state.data.items.map((i) => i.id));
+  state.selected = new Set([...state.selected].filter((id) => ids.has(id)));
   render();
+}
+
+/** Forgets the remembered person if their PIN was reset or they no longer exist. */
+function checkProfile() {
+  const p = state.profile;
+  if (!p) return;
+  const player = state.data.players[p.key];
+  if (!player || !player.hash || player.hash !== p.hash) forgetProfile();
+}
+
+function forgetProfile() {
+  state.profile = null;
+  local.set('profile', null);
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,6 +216,8 @@ function render() {
       : h('div', { class: 'empty' }, h('p', { class: 'empty__title' }, 'No gifts yet'), h('p', { class: 'empty__body' }, 'Press “Add a gift” and paste a link to a product.')),
   );
 
+  renderSelectionBar();
+
   document.getElementById('footer').replaceChildren(
     h(
       'div',
@@ -178,6 +227,9 @@ function render() {
         'p',
         { class: 'site-footer__links' },
         h('button', { type: 'button', class: 'link-button', onclick: () => withEditing(openSettings) }, icon('gear'), 'Settings'),
+        state.profile
+          ? h('span', { class: 'site-footer__me' }, `Voting as ${state.profile.name} · `, h('button', { type: 'button', class: 'link-button', onclick: () => (forgetProfile(), render(), toast('Signed out on this device.')) }, 'Not you?'))
+          : null,
       ),
     ),
   );
@@ -226,7 +278,9 @@ function card(it, index) {
       h('h2', { class: 'card__name', id: nameId }, it.name),
       it.price != null ? h('p', { class: 'price' }, formatPrice(it.price, it.currency)) : null,
       it.note ? h('p', { class: 'card__note' }, it.note) : null,
+      voters(it),
     ),
+    h('div', { class: 'card__actions' }, voteButton(it), selectButton(it)),
     h('a', { class: 'card__open', href: it.url, target: '_blank', rel: 'noopener noreferrer nofollow', 'aria-labelledby': nameId }),
     h(
       'div',
@@ -235,6 +289,149 @@ function card(it, index) {
       h('button', { type: 'button', class: 'tool tool--danger', 'aria-label': `Remove ${it.name}`, title: 'Remove', onclick: () => withEditing(() => confirmRemove(it)) }, icon('close')),
     ),
   );
+}
+
+function voters(it) {
+  if (!it.votes.length) return null;
+  const names = it.votes.map((k) => (state.profile && k === state.profile.key ? 'you' : state.data.players[k].name));
+  return h('p', { class: 'card__voters' }, `Voted by ${names.join(', ')}`);
+}
+
+function voteButton(it) {
+  const mine = Boolean(state.profile && it.votes.includes(state.profile.key));
+  return h(
+    'button',
+    { type: 'button', class: 'pill-button vote', 'aria-pressed': String(mine), 'aria-label': `${mine ? 'Remove your vote for' : 'Vote for'} ${it.name}, ${it.votes.length} ${it.votes.length === 1 ? 'vote' : 'votes'}`, onclick: () => withEditing(() => toggleVote(it)) },
+    icon('heart'),
+    h('span', null, String(it.votes.length)),
+  );
+}
+
+function selectButton(it) {
+  const on = state.selected.has(it.id);
+  return h(
+    'button',
+    {
+      type: 'button',
+      class: 'pill-button select',
+      'aria-pressed': String(on),
+      onclick: () => {
+        if (on) state.selected.delete(it.id);
+        else state.selected.add(it.id);
+        local.set('selected', [...state.selected]);
+        render();
+      },
+    },
+    icon(on ? 'check' : 'plus'),
+    on ? 'Selected' : 'Select',
+  );
+}
+
+/** Total of the gifts ticked on this device (not everyone's, not all gifts). */
+function renderSelectionBar() {
+  let bar = document.getElementById('selbar');
+  if (!bar) {
+    bar = h('div', { class: 'selbar', id: 'selbar', role: 'status', 'aria-live': 'polite' });
+    document.body.append(bar);
+  }
+  const chosen = state.data.items.filter((i) => state.selected.has(i.id));
+  document.body.classList.toggle('has-selbar', chosen.length > 0);
+  if (!chosen.length) return void bar.replaceChildren();
+  const sums = new Map();
+  for (const i of chosen) if (i.price != null) sums.set(i.currency, (sums.get(i.currency) || 0) + i.price);
+  const total = [...sums].map(([c, v]) => formatPrice(Math.round(v * 100) / 100, c)).join(' + ') || formatPrice(0, state.data.settings.currency);
+  const noPrice = chosen.filter((i) => i.price == null).length;
+  bar.replaceChildren(
+    h(
+      'div',
+      { class: 'selbar__inner' },
+      h(
+        'div',
+        { class: 'selbar__text' },
+        h('span', { class: 'selbar__label' }, `${chosen.length} selected${noPrice ? ` (${noPrice} without price)` : ''}`),
+        h('strong', { class: 'selbar__total' }, total),
+      ),
+      h('button', { type: 'button', class: 'selbar__clear', onclick: () => (state.selected.clear(), local.set('selected', []), render()) }, 'Clear'),
+    ),
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Voting: who are you? (name + PIN, remembered on this device)        */
+/* ------------------------------------------------------------------ */
+
+function askIdentity(then) {
+  const name = h('input', { class: 'input', type: 'text', autocomplete: 'nickname', maxlength: 24, required: true });
+  const pin = h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off', maxlength: 8, required: true, placeholder: '4 to 8 digits' });
+  const error = errorLine();
+  const submit = h('button', { type: 'submit', class: 'button button--solid' }, 'Continue');
+  const form = h(
+    'form',
+    { class: 'form' },
+    h('p', { class: 'dialog__text' }, 'So everyone can see who voted. First time: choose a PIN. On another phone or computer, use the same name and PIN.'),
+    field('Your name', name),
+    field('PIN', pin, 'This device remembers you afterwards.'),
+    error,
+    submit,
+  );
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    busy(submit, error, 'Checking…', async () => {
+      const shown = name.value.replace(/\s+/g, ' ').trim().slice(0, 24);
+      const key = playerKey(shown);
+      if (!key) throw new Error('Type your name.');
+      if (!isValidPin(pin.value.trim())) throw new Error('The PIN must be 4 to 8 digits.');
+      const existing = state.data.players[key];
+      let profile;
+      if (existing && existing.hash) {
+        const hash = await pinHash(pin.value.trim(), existing.salt);
+        if (hash !== existing.hash) throw new Error(`Wrong PIN for ${existing.name}. If that is not you, use another name.`);
+        profile = { key, name: existing.name, hash };
+      } else {
+        const salt = randomB64(16);
+        profile = { key, name: shown, hash: await pinHash(pin.value.trim(), salt), salt, isNew: true };
+      }
+      await then(profile);
+      dialog.close();
+    });
+  });
+  openDialog('Who are you?', form);
+}
+
+async function toggleVote(it) {
+  const run = async (profile) => {
+    let voted = false;
+    try {
+      await save((d) => {
+        const player = d.players[profile.key];
+        if (profile.isNew) {
+          if (player && player.hash && player.hash !== profile.hash) throw new UserError(`Someone just took the name ${player.name}. Choose another name.`);
+          d.players[profile.key] = { name: profile.name, salt: profile.salt, hash: profile.hash };
+        } else if (!player || player.hash !== profile.hash) {
+          throw new UserError('Please type your name and PIN again.');
+        }
+        const item = d.items.find((x) => x.id === it.id);
+        if (!item) throw new UserError('This gift was removed in the meantime.');
+        voted = !item.votes.includes(profile.key);
+        item.votes = voted ? [...item.votes, profile.key] : item.votes.filter((k) => k !== profile.key);
+      }, `Vote: ${profile.name} ${it.name}`);
+    } catch (e) {
+      if (/name and PIN again/.test(e.message)) forgetProfile();
+      throw e;
+    }
+    state.profile = { key: profile.key, name: profile.name, hash: profile.hash };
+    local.set('profile', state.profile);
+    render();
+    toast(voted ? `Voted for ${it.name}.` : 'Vote removed.');
+  };
+  if (state.profile) {
+    try {
+      await run(state.profile);
+    } catch (e) {
+      toast(e.message, 6000);
+      if (!state.profile) askIdentity(run);
+    }
+  } else askIdentity(run);
 }
 
 /* ------------------------------------------------------------------ */
@@ -468,8 +665,8 @@ function openItemForm(existing) {
       };
       await save((d) => {
         const i = d.items.findIndex((x) => x.id === item.id);
-        if (i === -1) d.items.unshift(item);
-        else d.items[i] = item;
+        if (i === -1) d.items.unshift({ ...item, votes: [] });
+        else d.items[i] = { ...item, votes: d.items[i].votes };
       }, `${isNew ? 'Add' : 'Edit'} gift: ${item.name}`);
       // Remove the old uploaded photo if it was replaced (best effort).
       if (!isNew && it.image && it.image !== image && it.image.startsWith('images/')) github().deleteFile(it.image, 'Remove old photo').catch(() => {});

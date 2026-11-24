@@ -164,11 +164,34 @@ export class GitHub {
 }
 
 /* ------------------------------------------------------------------ */
+/* People (name + PIN, like the betting app)                            */
+/* ------------------------------------------------------------------ */
+
+export const PIN_ITERATIONS = 100000;
+
+/** The same name always maps to the same person, whatever the capitals or spaces. */
+export function playerKey(name) {
+  return String(name || '').replace(/\s+/g, ' ').trim().slice(0, 24).normalize('NFKC').toLowerCase();
+}
+
+export const isValidPin = (pin) => /^\d{4,8}$/.test(String(pin));
+
+export function randomB64(n = 16) {
+  return bytesToB64(crypto.getRandomValues(new Uint8Array(n)));
+}
+
+export async function pinHash(pin, saltB64, iterations = PIN_ITERATIONS) {
+  const base = await crypto.subtle.importKey('raw', ENC.encode(String(pin)), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: b64ToBytes(saltB64), iterations }, base, 256);
+  return bytesToB64(new Uint8Array(bits));
+}
+
+/* ------------------------------------------------------------------ */
 /* Wishlist data                                                        */
 /* ------------------------------------------------------------------ */
 
 export function emptyWishlist() {
-  return { version: 0, settings: { title: 'Birthday Wishlist', subtitle: 'A few ideas, in case you need them.', date: '', currency: 'EUR' }, items: [] };
+  return { version: 0, settings: { title: 'Birthday Wishlist', subtitle: 'A few ideas, in case you need them.', date: '', currency: 'EUR' }, players: {}, items: [] };
 }
 
 const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
@@ -185,6 +208,14 @@ export function sanitizeWishlist(raw) {
     date: /^\d{4}-\d{2}-\d{2}$/.test(s.date) ? s.date : '',
     currency: /^[A-Z]{3}$/.test(s.currency) ? s.currency : 'EUR',
   };
+  const players = {};
+  if (raw.players && typeof raw.players === 'object') {
+    for (const [key, p] of Object.entries(raw.players)) {
+      const name = p && str(p.name, 24);
+      if (!name || playerKey(name) !== key) continue;
+      players[key] = { name, salt: str(p.salt, 64), hash: str(p.hash, 64) };
+    }
+  }
   const seen = new Set();
   const items = (Array.isArray(raw.items) ? raw.items : [])
     .map((it) => {
@@ -204,10 +235,11 @@ export function sanitizeWishlist(raw) {
         image: isSafeImage(it.image) ? it.image : '',
         note: str(it.note, 300),
         added: str(it.added, 30),
+        votes: [...new Set(Array.isArray(it.votes) ? it.votes.filter((k) => typeof k === 'string' && players[k]) : [])],
       };
     })
     .filter(Boolean);
-  return { version: Number.isInteger(raw.version) && raw.version >= 0 ? raw.version : 0, settings, items };
+  return { version: Number.isInteger(raw.version) && raw.version >= 0 ? raw.version : 0, settings, players, items };
 }
 
 export const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;

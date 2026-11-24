@@ -13,7 +13,7 @@ Two repositories:
 | Repository | Contains | Who can change it |
 |---|---|---|
 | `regalo` (public) | The website: `index.html`, `style.css`, `app.js`, `lib.js`, `connection.json`, `fonts/` | Only you, on GitHub |
-| `regalo-data` (private) | The gifts (`wishlist.json`) and uploaded photos (`images/`) | Everyone, through the website |
+| `regalo-data` (private) | The gifts, votes and names (`wishlist.json`) and uploaded photos (`images/`) | Everyone, through the website |
 
 `connection.json` holds a key that can only change `regalo-data`. Because of that split, nobody can ever change the website itself.
 
@@ -33,6 +33,8 @@ When **updating the website files** later, upload everything except `connection.
 
 - **Add:** **Add a gift** → paste the link → check the name, type the price, optionally a note (size, colour) or a photo → **Add to the list**.
 - **Edit:** the pencil on a gift. **Remove:** the × on a gift.
+- **Vote:** the ♥ on a gift. The first time, type your name and choose a 4–8 digit PIN; the device remembers you. On another phone or computer, use the same name and PIN. Everyone sees how many votes a gift has and who voted. Tap ♥ again to take your vote back. **Not you?** (bottom of the page) signs out on that device.
+- **Select:** **Select** on the gifts you are considering. A bar at the bottom shows how many you selected and their total price. The selection is only on your device; others do not see it.
 - **Title, subtitle, birthday date, currency:** **Settings** at the bottom.
 - Tapping a gift opens the store.
 
@@ -49,5 +51,6 @@ When **updating the website files** later, upload everything except `connection.
 
 - No password means anyone with the link can change the list. Share the link only with people you trust.
 - Someone with technical skills could take the key out of `connection.json`. It only reaches the private `regalo-data` repository, so the worst case is a messed-up gift list, which can be restored from its history. The website itself cannot be changed with it.
+- Names and PINs are for recognising people, not real security: PINs are stored only as salted hashes, but a 4-digit PIN could be guessed by someone determined. Do not reuse a bank PIN.
 - Product links are sent to Microlink (microlink.io), a free service, to read the name and photo, with a limited number of lookups per person per day.
 - The page only talks to `api.github.com` and `api.microlink.io` (enforced by a Content Security Policy), shows all text as plain text, and asks search engines not to index it.
